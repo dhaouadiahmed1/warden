@@ -1,4 +1,4 @@
-# Warden — v0.1 starter
+# Warden — v0.2
 
 A free, open-source Android firewall starter, inspired by the Warden app
 shown in the screenshot you sent (github.com/sammyZi/warden, v0.2.0,
@@ -29,12 +29,17 @@ name, icon and package.
   VpnService, the only way to control other apps' network access
   without root. The tunnel starts and ends on your phone; Warden runs
   no VPN server and sends no traffic anywhere else.
-  - `service/PacketParser.kt` — minimal IPv4 parsing.
+  - `service/PacketParser.kt` — IPv4 / TCP / UDP parsing, plus
+    IP/TCP/UDP packet building with checksums.
+  - `service/Forwarder.kt` — v0.2: TCP state machine (SYN/SYN-ACK/
+    data/FIN/RST) and UDP relay. Each real socket is protected with
+    `VpnService.protect()` first, so its traffic bypasses the TUN
+    and cannot loop back into the firewall.
   - `service/UidLookup.kt` — maps a source port to the owning app UID
     via `/proc/net/tcp`, `/proc/net/udp`, etc., the technique other
     no-root firewalls use.
-  - Blocked packets are dropped. Everything stays on the phone:
-    no account, no analytics, no ads.
+  - Blocked TCP gets a RST (fails fast); blocked UDP is dropped.
+    Everything stays on the phone: no account, no analytics, no ads.
 
 ## How a no-root firewall works (short version)
 
@@ -46,19 +51,27 @@ drops the blocked ones, and forwards the rest. That is why the phone
 shows a VPN key icon while protection is on, even though no traffic
 leaves the phone to a VPN server.
 
-## ⚠️ Read this before daily use — v0.1 limit
+## v0.2 status — forwarding is in, with starter limits
 
-**Packet forwarding is NOT finished in v0.1.** When Protection is ON,
-the service establishes the TUN, parses packets, looks up the app and
-logs Seen / Blocked — but allowed packets are not yet forwarded back
-to the internet. So apps will appear offline while Protection is ON.
-Turn it OFF to restore internet immediately.
+**v0.2 forwards allowed traffic.** When Protection is ON, allowed
+apps should now stay online: TCP connections are proxied and UDP
+datagrams are relayed, with replies returned through the TUN.
+Blocked apps fail fast (TCP RST) or are dropped (UDP).
 
-That is deliberate and labelled in the app itself (a warning dialog
-appears before you turn it on). v0.1 is a working starter for the UI,
-rules, log and VPN plumbing — not yet a daily-driver firewall.
+Starter limits that remain in v0.2, so test before daily use:
+- IPv6 is not forwarded yet; IPv6 packets are dropped.
+- TCP out-of-order segments are dropped (the client retransmits);
+  there is no retransmission of our own segments and no window
+  scaling / SACK.
+- One thread per TCP connection and per UDP flow, with a 2-minute
+  idle timeout for UDP.
+- The Log screen records one entry per flow, not per packet, so it
+  does not flood during a download or video.
+
 **Test it on a spare device first, and do not rely on it as your
-only protection yet.**
+only protection yet.** If Protection ON breaks an app, turn it OFF
+to restore internet immediately and report which app and what
+happened.
 
 ## Build it — from a phone, no PC
 
@@ -83,17 +96,18 @@ from the run's Artifacts as `warden-debug-apk`.
 1. Open Apps, block one app you can test with (for example a browser
    you do not need for the test).
 2. Turn Protection ON, accept the warning, allow the VPN.
-3. Open that app — its attempts should appear in Log as Blocked
-   (or Seen, if the UID lookup misses a short-lived socket).
-4. Turn Protection OFF and confirm internet works again normally.
+3. Open an allowed app (e.g. a browser) — it should stay online,
+   with its flows in Log as Seen.
+4. Open the blocked app — its attempts should appear in Log as
+   Blocked and fail fast, instead of loading.
+5. Turn Protection OFF and confirm internet works again normally.
 
 ## Roadmap
 
-- **v0.2 — the forwarder:** TCP/UDP proxy that forwards allowed
-  packets and returns replies through the TUN, so Protection ON no
-  longer breaks the internet. This is the step that turns v0.1 into a
-  usable firewall. Also: IPv6 parsing, DNS filtering for tracker
-  domains, real world map, data-use counters.
+- **v0.2 — done:** TCP/UDP forwarder, so Protection ON no longer
+  breaks the internet for allowed apps. Remaining: IPv6 forwarding,
+  DNS filtering for tracker domains, real world map, data-use
+  counters.
 - **v0.3:** per-app Wi-Fi vs mobile rules, allow/block by domain,
   export/import rules, lockdown mode (block everything when the
   VPN drops).
@@ -115,7 +129,7 @@ android/
   app/src/main/java/app/warden/
     MainActivity.kt
     data/Models.kt, data/WardenStore.kt
-    service/WardenVpnService.kt, service/PacketParser.kt, service/UidLookup.kt
+    service/WardenVpnService.kt, service/PacketParser.kt, service/Forwarder.kt, service/UidLookup.kt
     ui/WardenViewModel.kt, ui/theme/Theme.kt, ui/screens/Screens.kt
   app/src/main/res/ (strings, theme, shield icon, launcher icons)
 ```
