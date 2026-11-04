@@ -11,22 +11,25 @@ import app.warden.R
 import app.warden.data.LogAction
 import app.warden.data.WardenStore
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * No-root firewall engine, v0.1.
+ * No-root firewall engine, v0.2.
  *
  * How it works: VpnService creates a local TUN interface. All traffic is
  * routed through it, on this phone only. Each packet is parsed, its owning
  * app is looked up by source port, and the app's rule is checked.
- * Blocked packets are dropped. Allowed packets are logged as SEEN.
  *
- * IMPORTANT v0.1 LIMIT (read README.md before daily use):
- * Packet forwarding back to the internet (the TCP/UDP proxy) is NOT
- * finished yet. While Protection is ON in this starter, allowed traffic
- * is logged but not forwarded, so apps will appear offline until you
- * turn Protection OFF. v0.2 is exactly that forwarder. Do not rely on
- * v0.1 as your only protection, and test it on a spare device first.
+ * v0.2 change: allowed packets are now actually forwarded. See
+ * Forwarder.kt: TCP gets a real socket with a handshake, UDP gets a
+ * relay socket. Blocked packets are dropped (UDP) or answered with a
+ * TCP RST, so a blocked app fails fast instead of hanging.
+ *
+ * What v0.2 still does not do: IPv6 forwarding, TCP out-of-order
+ * reassembly, and retransmission of our own segments. See README.md.
+ * Test on a spare device first; do not rely on any starter as your
+ * only protection.
  */
 class WardenVpnService : VpnService() {
 
@@ -39,6 +42,7 @@ class WardenVpnService : VpnService() {
 
     private var tun: ParcelFileDescriptor? = null
     private val running = AtomicBoolean(false)
+    private var forwarder: Forwarder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -57,7 +61,7 @@ class WardenVpnService : VpnService() {
         createChannel()
         val notification: Notification = Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Warden protection is on")
-            .setContentText("Traffic stays on this phone. Turn it off in the app to restore internet (v0.1 test build).")
+            .setContentText("Traffic stays on this phone. Turn it off in the app to restore normal routing.")
             .setSmallIcon(R.drawable.ic_shield)
             .build()
         startForeground(NOTIFICATION_ID, notification)
@@ -72,8 +76,35 @@ class WardenVpnService : VpnService() {
         tun = builder.establish()
         WardenStore.setProtectionOn(true)
 
+        val fd = tun ?: run {
+            running.set(false)
+            return
+        }
+        val tunOutput = FileOutputStream(fd.fileDescriptor)
+        val tunWriteLock = Any()
+        val writeToTun: (ByteArray) -> Unit = { bytes ->
+            synchronized(tunWriteLock) {
+                runCatching { tunOutput.write(bytes); tunOutput.flush() }
+            }
+        }
+        val fwd = Forwarder(
+            writeToTun = writeToTun,
+            protectSocket = { socket -> protect(socket) },
+            protectDatagram = { socket -> protect(socket) },
+            onNewFlow = { destinationIp, protocol ->
+                // Log once per flow, not once per packet, or the Log
+                // screen would be flooded by every data segment.
+                WardenStore.addLog(
+                    appName = "Connection",
+                    destination = destinationIp,
+                    protocol = protocol,
+                    action = LogAction.SEEN
+                )
+            }
+        )
+        forwarder = fwd
+
         Thread({
-            val fd = tun ?: return@Thread
             val input = FileInputStream(fd.fileDescriptor)
             val buffer = ByteArray(32767)
             try {
@@ -81,6 +112,10 @@ class WardenVpnService : VpnService() {
                     val length = input.read(buffer)
                     if (length <= 0) continue
                     val packet = PacketParser.parse(buffer, length) ?: continue
+                    // Only TCP and UDP are forwarded in v0.2.
+                    if (packet.protocol != PacketParser.PROTO_TCP &&
+                        packet.protocol != PacketParser.PROTO_UDP
+                    ) continue
                     val uid = UidLookup.findUid(packet.sourcePort)
                     val packages = if (uid != null) {
                         packageManager.getPackagesForUid(uid)
@@ -94,15 +129,24 @@ class WardenVpnService : VpnService() {
                         }.getOrNull()
                     } ?: "Unknown app"
                     val blocked = WardenStore.isBlocked(packageName)
-                    WardenStore.addLog(
-                        appName = appName,
-                        destination = packet.destinationIp,
-                        protocol = packet.protocol,
-                        action = if (blocked) LogAction.BLOCKED else LogAction.SEEN
-                    )
-                    // Blocked: drop (do nothing). Allowed: v0.1 does NOT
-                    // forward yet -- see the class comment and README.md.
-                    // v0.2 adds the forwarder here, before this point.
+                    if (blocked) {
+                        WardenStore.addLog(
+                            appName = appName,
+                            destination = packet.destinationIp,
+                            protocol = packet.protocolName,
+                            action = LogAction.BLOCKED
+                        )
+                        // Blocked TCP: RST so the app fails fast instead
+                        // of waiting for a timeout. Blocked UDP: drop.
+                        if (packet.protocol == PacketParser.PROTO_TCP) {
+                            fwd.resetTcp(packet)
+                        }
+                        continue
+                    }
+                    // Allowed: forward. Per-flow logging happens in
+                    // Forwarder.onNewFlow, so data packets stay quiet
+                    // and the Log screen is not flooded.
+                    fwd.handle(packet)
                 }
             } catch (e: Exception) {
                 Log.w("WardenVpn", "Tunnel loop ended", e)
@@ -112,6 +156,8 @@ class WardenVpnService : VpnService() {
 
     private fun stopTunnel() {
         running.set(false)
+        forwarder?.close()
+        forwarder = null
         runCatching { tun?.close() }
         tun = null
         WardenStore.setProtectionOn(false)
